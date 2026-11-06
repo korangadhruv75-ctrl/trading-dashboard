@@ -6,7 +6,6 @@ Run (Windows, MT5 terminal open and logged in):
 
 Use a DEMO account while testing. Analysis only, it never places trades.
 """
-import json
 import os
 
 import pandas as pd
@@ -333,7 +332,7 @@ def ask_ai(api_key, model, context, history, images=None):
         timeout=40,
         max_retries=0,
     )
-    clean = [{"role": m["role"], "content": m["content"]} for m in history if m.get("content")][-20:]
+    clean = [{"role": m["role"], "content": m["content"]} for m in history if m.get("content")][-10:]
     if images and clean:
         import base64
 
@@ -372,40 +371,6 @@ def ask_with_fallback(api_key, models, context, history, images=None):
     raise RuntimeError(" | ".join(errors))
 
 
-# ---------- chat memory (saved on this PC only) ----------
-HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
-MAX_SAVED = 60
-
-
-def load_history():
-    try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return [
-            m for m in data
-            if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
-        ]
-    except (OSError, ValueError):
-        return []
-
-
-def save_history(messages):
-    slim = [
-        {
-            "role": m["role"],
-            "content": m["content"],
-            "label": m.get("label"),
-            "had_images": bool(m.get("images")) or bool(m.get("had_images")),
-        }
-        for m in messages
-    ][-MAX_SAVED:]
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(slim, f, ensure_ascii=False)
-    except OSError:
-        pass
-
-
 # ---------- callbacks ----------
 def pick_symbol(s):
     st.session_state.symbol = s
@@ -418,8 +383,7 @@ def queue_briefing(label, text):
 # ---------- sidebar ----------
 st.session_state.setdefault("symbol", "XAUUSD")
 if "messages" not in st.session_state:
-    # only reload saved chats when running on your own PC (MT5 present), never on a shared server
-    st.session_state.messages = load_history() if mt5 is not None else []
+    st.session_state.messages = []
 
 st.title("My Market Desk")
 
@@ -451,17 +415,8 @@ with st.sidebar:
     api_key = key_override.strip() or load_key()
     models = [model_override.strip()] if model_override.strip() else MODELS
     st.caption("NVIDIA key loaded" if api_key else "No NVIDIA key found")
-    remember = st.toggle(
-        "Remember chat on this PC",
-        value=(mt5 is not None),
-        disabled=(mt5 is None),
-        help="Saves your chat to chat_history.json so it survives a refresh or restart. "
-        "Off on shared servers like Streamlit Cloud.",
-    )
     if st.button("Clear chat"):
         st.session_state.messages = []
-        if remember:
-            save_history([])
 
 # ---------- data ----------
 df, live = get_mt5_candles(mt5_symbol, tf, count)
@@ -590,8 +545,6 @@ with box:
         with st.chat_message(m["role"]):
             for raw in m.get("images", []):
                 st.image(raw, width=280)
-            if m.get("had_images") and not m.get("images"):
-                st.caption("📎 a screenshot was attached here")
             st.write(m.get("label") or m["content"])
     if q_text:
         st.session_state.messages.append(
@@ -619,8 +572,6 @@ with box:
                     reply = f"The AI call failed on every model: {e}"
             st.write(reply)
         st.session_state.messages.append({"role": "assistant", "content": reply})
-        if remember:
-            save_history(st.session_state.messages)
 
 # ---------- facts, backdrop, news ----------
 left, right = st.columns(2)
