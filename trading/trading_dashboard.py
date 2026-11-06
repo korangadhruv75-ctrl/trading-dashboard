@@ -6,13 +6,13 @@ Run (Windows, MT5 terminal open and logged in):
 
 Use a DEMO account while testing. Analysis only, it never places trades.
 """
+import json
 import os
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from streamlit.errors import StreamlitSecretNotFoundError
 
 try:
     import MetaTrader5 as mt5
@@ -115,6 +115,8 @@ KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nvidia_key.
 # no key is stored in the code: put it in a file named nvidia_key.txt next to this script
 DEFAULT_KEY = ""
 
+st.set_page_config(page_title="My Market Desk", layout="wide")
+
 
 # ---------- helpers ----------
 def guess_yahoo(symbol):
@@ -131,12 +133,6 @@ def load_key():
     key = os.environ.get("NVIDIA_API_KEY", "").strip()
     if key:
         return key
-    try:
-        key = st.secrets.get("NVIDIA_API_KEY", "").strip()
-        if key:
-            return key
-    except StreamlitSecretNotFoundError:
-        pass
     try:
         with open(KEY_FILE, encoding="utf-8") as f:
             key = f.read().strip()
@@ -337,7 +333,7 @@ def ask_ai(api_key, model, context, history, images=None):
         timeout=40,
         max_retries=0,
     )
-    clean = [{"role": m["role"], "content": m["content"]} for m in history if m.get("content")][-10:]
+    clean = [{"role": m["role"], "content": m["content"]} for m in history if m.get("content")][-20:]
     if images and clean:
         import base64
 
@@ -349,6 +345,7 @@ def ask_ai(api_key, model, context, history, images=None):
     messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\nLIVE DATA:\n" + context}] + clean
     kwargs = dict(model=model, messages=messages, temperature=0.3, max_tokens=1500)
     try:
+        # ask thinking models to answer straight away (ignored or rejected by some models)
         resp = client.chat.completions.create(
             **kwargs, extra_body={"chat_template_kwargs": {"enable_thinking": False}}
         )
@@ -375,6 +372,40 @@ def ask_with_fallback(api_key, models, context, history, images=None):
     raise RuntimeError(" | ".join(errors))
 
 
+# ---------- chat memory (saved on this PC only) ----------
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
+MAX_SAVED = 60
+
+
+def load_history():
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return [
+            m for m in data
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+    except (OSError, ValueError):
+        return []
+
+
+def save_history(messages):
+    slim = [
+        {
+            "role": m["role"],
+            "content": m["content"],
+            "label": m.get("label"),
+            "had_images": bool(m.get("images")) or bool(m.get("had_images")),
+        }
+        for m in messages
+    ][-MAX_SAVED:]
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(slim, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
 # ---------- callbacks ----------
 def pick_symbol(s):
     st.session_state.symbol = s
@@ -384,219 +415,227 @@ def queue_briefing(label, text):
     st.session_state.pending = (label, text)
 
 
-def main():
-    st.set_page_config(page_title="My Market Desk", layout="wide")
+# ---------- sidebar ----------
+st.session_state.setdefault("symbol", "XAUUSD")
+if "messages" not in st.session_state:
+    # only reload saved chats when running on your own PC (MT5 present), never on a shared server
+    st.session_state.messages = load_history() if mt5 is not None else []
 
-    # ---------- sidebar ----------
-    st.session_state.setdefault("symbol", "XAUUSD")
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+st.title("My Market Desk")
 
-    st.title("My Market Desk")
-
-    with st.sidebar:
-        st.header("Settings")
-        mt5_symbol = st.text_input("MT5 symbol", key="symbol")
-        st.caption("Quick pick (the name must match your broker's symbol):")
-        qcols = st.columns(2)
-        for i, s in enumerate(QUICK_SYMBOLS):
-            qcols[i % 2].button(s, key=f"q_{s}", on_click=pick_symbol, args=(s,))
-        yahoo_override = st.text_input(
-            "Yahoo ticker (optional)",
-            "",
-            help="Leave empty to auto-detect from the MT5 symbol. Examples: GC=F, EURUSD=X, ^GSPC, AAPL",
-        )
-        yahoo_ticker = yahoo_override.strip() or guess_yahoo(mt5_symbol)
-        st.caption(f"Using Yahoo ticker: {yahoo_ticker}")
-        tf = st.selectbox("Chart timeframe", list(TIMEFRAMES), index=1)
-        count = st.slider("Candles", 100, 1000, 300, 50)
-        if st.button("Refresh"):
-            st.cache_data.clear()
-        st.divider()
-        st.header("AI chat")
-        with st.expander("Advanced (optional)"):
-            key_override = st.text_input("Use a different NVIDIA key", type="password")
-            model_override = st.text_input(
-                "Use a specific model", "", help="Leave empty and the app picks a working model by itself."
-            )
-        api_key = key_override.strip() or load_key()
-        models = [model_override.strip()] if model_override.strip() else MODELS
-        st.caption("NVIDIA key loaded" if api_key else "No NVIDIA key found")
-        if st.button("Clear chat"):
-            st.session_state.messages = []
-
-    # ---------- data ----------
-    df, live = get_mt5_candles(mt5_symbol, tf, count)
-    source = "MT5"
-    if df is None:
-        df = get_yahoo_candles(yahoo_ticker, tf)
-        live = {}
-        source = "Yahoo (MT5 not connected)"
-
-    if df is None or len(df) < 60:
-        st.error("No chart data. Check that MT5 is open and logged in, and that the symbol names are right.")
-        st.stop()
-
-    df = add_indicators(df)
-    last = df.iloc[-1]
-    call, score = verdict(df)
-    mtf = trend_by_timeframe(mt5_symbol, yahoo_ticker)
-
-    info = yahoo_info(yahoo_ticker)
-    backdrop = market_backdrop()
-    news_tickers = tuple(dict.fromkeys([yahoo_ticker, "DX-Y.NYB", "^GSPC"]))
-    headlines = get_news(news_tickers)
-
-    facts = {
-        "Name": info.get("shortName") or info.get("longName"),
-        "Previous close": info.get("previousClose"),
-        "Day low": info.get("dayLow"),
-        "Day high": info.get("dayHigh"),
-        "Volume": info.get("volume"),
-        "52w low": info.get("fiftyTwoWeekLow"),
-        "52w high": info.get("fiftyTwoWeekHigh"),
-        "Market cap": info.get("marketCap"),
-        "P/E": info.get("trailingPE"),
-    }
-    facts = {k: v for k, v in facts.items() if v is not None}
-    if live:
-        facts["MT5 bid"] = live.get("bid")
-        facts["MT5 ask"] = live.get("ask")
-        facts["Spread (points)"] = live.get("spread_points")
-
-    tf_lines = []
-    for label, r in mtf.items():
-        if r:
-            tf_lines.append(
-                f"{label}: {r['call']}, RSI {r['rsi']:.0f}, ATR {r['atr']:.5g}, "
-                f"50-bar high {r['high']:.5g}, low {r['low']:.5g}"
-            )
-        else:
-            tf_lines.append(f"{label}: no data")
-    backdrop_text = backdrop.to_string(index=False) if not backdrop.empty else "not available"
-    context = (
-        f"Symbol {mt5_symbol} (Yahoo {yahoo_ticker}), chart timeframe {tf}, chart source {source}\n"
-        f"Last close {last.close}, EMA20 {last.ema20:.5g}, EMA50 {last.ema50:.5g}, "
-        f"RSI {last.rsi:.1f}, ATR {last.atr:.5g}\n"
-        f"Rule-based call on {tf}: {call}\n"
-        f"Trend by timeframe:\n" + "\n".join(tf_lines) + "\n"
-        f"Live quote: {live}\nYahoo facts for {yahoo_ticker}: {facts}\n"
-        f"Market backdrop (last close, daily change %):\n{backdrop_text}\n"
-        f"News headlines:\n" + "\n".join("- " + h for h in headlines) + "\n"
-        f"Last 15 candles on {tf}:\n{df[['time','open','high','low','close']].tail(15).to_string(index=False)}"
+with st.sidebar:
+    st.header("Settings")
+    mt5_symbol = st.text_input("MT5 symbol", key="symbol")
+    st.caption("Quick pick (the name must match your broker's symbol):")
+    qcols = st.columns(2)
+    for i, s in enumerate(QUICK_SYMBOLS):
+        qcols[i % 2].button(s, key=f"q_{s}", on_click=pick_symbol, args=(s,))
+    yahoo_override = st.text_input(
+        "Yahoo ticker (optional)",
+        "",
+        help="Leave empty to auto-detect from the MT5 symbol. Examples: GC=F, EURUSD=X, ^GSPC, AAPL",
     )
+    yahoo_ticker = yahoo_override.strip() or guess_yahoo(mt5_symbol)
+    st.caption(f"Using Yahoo ticker: {yahoo_ticker}")
+    tf = st.selectbox("Chart timeframe", list(TIMEFRAMES), index=1)
+    count = st.slider("Candles", 100, 1000, 300, 50)
+    if st.button("Refresh"):
+        st.cache_data.clear()
+    st.divider()
+    st.header("AI chat")
+    with st.expander("Advanced (optional)"):
+        key_override = st.text_input("Use a different NVIDIA key", type="password")
+        model_override = st.text_input(
+            "Use a specific model", "", help="Leave empty and the app picks a working model by itself."
+        )
+    api_key = key_override.strip() or load_key()
+    models = [model_override.strip()] if model_override.strip() else MODELS
+    st.caption("NVIDIA key loaded" if api_key else "No NVIDIA key found")
+    remember = st.toggle(
+        "Remember chat on this PC",
+        value=(mt5 is not None),
+        disabled=(mt5 is None),
+        help="Saves your chat to chat_history.json so it survives a refresh or restart. "
+        "Off on shared servers like Streamlit Cloud.",
+    )
+    if st.button("Clear chat"):
+        st.session_state.messages = []
+        if remember:
+            save_history([])
 
-    # ---------- top row: arrows ----------
-    ref = df["close"].iloc[-13] if len(df) > 13 else df["close"].iloc[0]
-    chg = float(last.close - ref)
-    pct = chg / float(ref) * 100
-    icon = {"BULLISH": "▲", "BEARISH": "▼"}.get(call, "►")
+# ---------- data ----------
+df, live = get_mt5_candles(mt5_symbol, tf, count)
+source = "MT5"
+if df is None:
+    df = get_yahoo_candles(yahoo_ticker, tf)
+    live = {}
+    source = "Yahoo (MT5 not connected)"
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Trend call", f"{icon} {call}")
-    c2.metric("Price", f"{last.close:.5g}", delta=f"{chg:+.5g} ({pct:+.2f}%)", help="Change over the last 12 candles")
-    c3.metric("RSI (14)", f"{last.rsi:.1f}")
-    c4.metric("ATR (14)", f"{last.atr:.5g}")
-    st.caption(f"{mt5_symbol} | chart source: {source} | rule-based call from EMA20/EMA50 and RSI, score {score} of 3")
+if df is None or len(df) < 60:
+    st.error("No chart data. Check that MT5 is open and logged in, and that the symbol names are right.")
+    st.stop()
 
-    st.caption("Trend by timeframe")
-    tcols = st.columns(len(TIMEFRAMES))
-    for col, label in zip(tcols, TIMEFRAMES):
-        r = mtf.get(label)
-        col.markdown(f"**{label}**  \n{arrow_md(r['call']) if r else 'n/a'}")
+df = add_indicators(df)
+last = df.iloc[-1]
+call, score = verdict(df)
+mtf = trend_by_timeframe(mt5_symbol, yahoo_ticker)
 
-    # ---------- chart (left) + AI (right) ----------
-    chart_col, chat_col = st.columns([2.2, 1.2])
+info = yahoo_info(yahoo_ticker)
+backdrop = market_backdrop()
+news_tickers = tuple(dict.fromkeys([yahoo_ticker, "DX-Y.NYB", "^GSPC"]))
+headlines = get_news(news_tickers)
 
-    with chart_col:
-        fig = go.Figure()
-        fig.add_candlestick(x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Price")
-        fig.add_scatter(x=df["time"], y=df["ema20"], name="EMA20", line=dict(width=1.2))
-        fig.add_scatter(x=df["time"], y=df["ema50"], name="EMA50", line=dict(width=1.2))
-        fig.update_layout(height=560, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=10, b=0))
-        lo, hi = df["low"].quantile(0.01), df["high"].quantile(0.99)
-        pad = (hi - lo) * 0.1
-        fig.update_yaxes(range=[lo - pad, hi + pad])
-        st.plotly_chart(fig, width="stretch")
+facts = {
+    "Name": info.get("shortName") or info.get("longName"),
+    "Previous close": info.get("previousClose"),
+    "Day low": info.get("dayLow"),
+    "Day high": info.get("dayHigh"),
+    "Volume": info.get("volume"),
+    "52w low": info.get("fiftyTwoWeekLow"),
+    "52w high": info.get("fiftyTwoWeekHigh"),
+    "Market cap": info.get("marketCap"),
+    "P/E": info.get("trailingPE"),
+}
+facts = {k: v for k, v in facts.items() if v is not None}
+if live:
+    facts["MT5 bid"] = live.get("bid")
+    facts["MT5 ask"] = live.get("ask")
+    facts["Spread (points)"] = live.get("spread_points")
 
-    with chat_col:
-        st.subheader("AI assistant")
-        st.caption("One-tap briefings:")
-        bcols = st.columns(2)
-        for i, (label, text) in enumerate(BRIEFINGS.items()):
-            bcols[i % 2].button(label, key=f"b_{i}", on_click=queue_briefing, args=(label, text))
-        box = st.container(height=400)
-        try:
-            typed = st.chat_input(
-                "Ask anything, or attach / paste a screenshot of your trades",
-                accept_file=True,
-                file_type=["png", "jpg", "jpeg", "webp"],
-            )
-        except TypeError:
-            typed = st.chat_input("Ask anything, e.g. where are the key levels?")
+tf_lines = []
+for label, r in mtf.items():
+    if r:
+        tf_lines.append(
+            f"{label}: {r['call']}, RSI {r['rsi']:.0f}, ATR {r['atr']:.5g}, "
+            f"50-bar high {r['high']:.5g}, low {r['low']:.5g}"
+        )
+    else:
+        tf_lines.append(f"{label}: no data")
+backdrop_text = backdrop.to_string(index=False) if not backdrop.empty else "not available"
+context = (
+    f"Symbol {mt5_symbol} (Yahoo {yahoo_ticker}), chart timeframe {tf}, chart source {source}\n"
+    f"Last close {last.close}, EMA20 {last.ema20:.5g}, EMA50 {last.ema50:.5g}, "
+    f"RSI {last.rsi:.1f}, ATR {last.atr:.5g}\n"
+    f"Rule-based call on {tf}: {call}\n"
+    f"Trend by timeframe:\n" + "\n".join(tf_lines) + "\n"
+    f"Live quote: {live}\nYahoo facts for {yahoo_ticker}: {facts}\n"
+    f"Market backdrop (last close, daily change %):\n{backdrop_text}\n"
+    f"News headlines:\n" + "\n".join("- " + h for h in headlines) + "\n"
+    f"Last 15 candles on {tf}:\n{df[['time','open','high','low','close']].tail(15).to_string(index=False)}"
+)
 
-        pending = st.session_state.pop("pending", None)
-        typed_text, typed_files = split_input(typed)
-        q_images = []
-        if typed_text or typed_files:
-            q_label, q_text = None, typed_text or DEFAULT_IMAGE_PROMPT
-            q_images = [prepare_image(f) for f in typed_files]
-        elif pending:
-            q_label, q_text = pending
-        else:
-            q_label, q_text = None, None
+# ---------- top row: arrows ----------
+ref = df["close"].iloc[-13] if len(df) > 13 else df["close"].iloc[0]
+chg = float(last.close - ref)
+pct = chg / float(ref) * 100
+icon = {"BULLISH": "▲", "BEARISH": "▼"}.get(call, "►")
 
-        with box:
-            for m in st.session_state.messages:
-                with st.chat_message(m["role"]):
-                    for raw in m.get("images", []):
-                        st.image(raw, width=280)
-                    st.write(m.get("label") or m["content"])
-            if q_text:
-                st.session_state.messages.append(
-                    {"role": "user", "content": q_text, "label": q_label, "images": q_images}
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Trend call", f"{icon} {call}")
+c2.metric("Price", f"{last.close:.5g}", delta=f"{chg:+.5g} ({pct:+.2f}%)", help="Change over the last 12 candles")
+c3.metric("RSI (14)", f"{last.rsi:.1f}")
+c4.metric("ATR (14)", f"{last.atr:.5g}")
+st.caption(f"{mt5_symbol} | chart source: {source} | rule-based call from EMA20/EMA50 and RSI, score {score} of 3")
+
+st.caption("Trend by timeframe")
+tcols = st.columns(len(TIMEFRAMES))
+for col, label in zip(tcols, TIMEFRAMES):
+    r = mtf.get(label)
+    col.markdown(f"**{label}**  \n{arrow_md(r['call']) if r else 'n/a'}")
+
+# ---------- chart (left) + AI (right) ----------
+chart_col, chat_col = st.columns([2.2, 1.2])
+
+with chart_col:
+    fig = go.Figure()
+    fig.add_candlestick(x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Price")
+    fig.add_scatter(x=df["time"], y=df["ema20"], name="EMA20", line=dict(width=1.2))
+    fig.add_scatter(x=df["time"], y=df["ema50"], name="EMA50", line=dict(width=1.2))
+    fig.update_layout(height=560, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=10, b=0))
+    # zoom to the middle 98% of prices so one bad spike candle can't squash the chart
+    lo, hi = df["low"].quantile(0.01), df["high"].quantile(0.99)
+    pad = (hi - lo) * 0.1
+    fig.update_yaxes(range=[lo - pad, hi + pad])
+    st.plotly_chart(fig, width="stretch")
+
+with chat_col:
+    st.subheader("AI assistant")
+    st.caption("One-tap briefings:")
+    bcols = st.columns(2)
+    for i, (label, text) in enumerate(BRIEFINGS.items()):
+        bcols[i % 2].button(label, key=f"b_{i}", on_click=queue_briefing, args=(label, text))
+    box = st.container(height=400)
+    try:
+        typed = st.chat_input(
+            "Ask anything, or attach / paste a screenshot of your trades",
+            accept_file=True,
+            file_type=["png", "jpg", "jpeg", "webp"],
+        )
+    except TypeError:  # older Streamlit without file support
+        typed = st.chat_input("Ask anything, e.g. where are the key levels?")
+
+pending = st.session_state.pop("pending", None)
+typed_text, typed_files = split_input(typed)
+q_images = []
+if typed_text or typed_files:
+    q_label, q_text = None, typed_text or DEFAULT_IMAGE_PROMPT
+    q_images = [prepare_image(f) for f in typed_files]
+elif pending:
+    q_label, q_text = pending
+else:
+    q_label, q_text = None, None
+
+with box:
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            for raw in m.get("images", []):
+                st.image(raw, width=280)
+            if m.get("had_images") and not m.get("images"):
+                st.caption("📎 a screenshot was attached here")
+            st.write(m.get("label") or m["content"])
+    if q_text:
+        st.session_state.messages.append(
+            {"role": "user", "content": q_text, "label": q_label, "images": q_images}
+        )
+        use_models = ([model_override.strip()] if model_override.strip() else VISION_MODELS) if q_images else models
+        with st.chat_message("user"):
+            for raw in q_images:
+                st.image(raw, width=280)
+            st.write(q_label or q_text)
+        with st.chat_message("assistant"):
+            if not api_key:
+                reply = (
+                    "No NVIDIA key found. Create a file called nvidia_key.txt next to this script, "
+                    "paste your key inside, save, then press F5. (Or paste it under Advanced in the sidebar.)"
                 )
-                use_models = ([model_override.strip()] if model_override.strip() else VISION_MODELS) if q_images else models
-                with st.chat_message("user"):
-                    for raw in q_images:
-                        st.image(raw, width=280)
-                    st.write(q_label or q_text)
-                with st.chat_message("assistant"):
-                    if not api_key:
-                        reply = (
-                            "No NVIDIA key found. Create a file called nvidia_key.txt next to this script, "
-                            "paste your key inside, save, then press F5. (Or paste it under Advanced in the sidebar.)"
+            else:
+                try:
+                    with st.spinner("Thinking..."):
+                        reply, used = ask_with_fallback(
+                            api_key, use_models, context, st.session_state.messages, q_images
                         )
-                    else:
-                        try:
-                            with st.spinner("Thinking..."):
-                                reply, used = ask_with_fallback(
-                                    api_key, use_models, context, st.session_state.messages, q_images
-                                )
-                            reply = f"{reply}\n\n*Answered by {used}*"
-                        except Exception as e:
-                            reply = f"The AI call failed on every model: {e}"
-                    st.write(reply)
-                st.session_state.messages.append({"role": "assistant", "content": reply})
+                    reply = f"{reply}\n\n*Answered by {used}*"
+                except Exception as e:
+                    reply = f"The AI call failed on every model: {e}"
+            st.write(reply)
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+        if remember:
+            save_history(st.session_state.messages)
 
-    # ---------- facts, backdrop, news ----------
-    left, right = st.columns(2)
-    with left:
-        st.subheader(f"Market facts ({yahoo_ticker})")
-        st.table(pd.DataFrame({"Value": facts}).astype(str))
-        st.subheader("Market backdrop")
-        if backdrop.empty:
-            st.write("Backdrop data not available right now.")
-        else:
-            st.dataframe(backdrop, hide_index=True)
-    with right:
-        st.subheader("Latest news")
-        if headlines:
-            for h in headlines:
-                st.write("- " + h)
-        else:
-            st.write("No headlines found.")
-
-
-if __name__ == "__main__":
-    main()
+# ---------- facts, backdrop, news ----------
+left, right = st.columns(2)
+with left:
+    st.subheader(f"Market facts ({yahoo_ticker})")
+    st.table(pd.DataFrame({"Value": facts}).astype(str))
+    st.subheader("Market backdrop")
+    if backdrop.empty:
+        st.write("Backdrop data not available right now.")
+    else:
+        st.dataframe(backdrop, hide_index=True)
+with right:
+    st.subheader("Latest news")
+    if headlines:
+        for h in headlines:
+            st.write("- " + h)
+    else:
+        st.write("No headlines found.")
